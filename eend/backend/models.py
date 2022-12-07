@@ -303,12 +303,11 @@ class TransformerEDADiarization(Module):
         self.vad_loss_weight = vad_loss_weight
 
     def get_embeddings(self, xs: torch.Tensor) -> torch.Tensor:
-        ilens = [x.shape[0] for x in xs]
         # xs: (B, T, F)
         pad_shape = xs.shape
         # emb: (B*T, E)
         emb = self.enc(xs)
-        # emb: [(T, E), ...]
+        # emb: (B, T, E)
         emb = emb.reshape(pad_shape[0], pad_shape[1], -1)
         return emb
 
@@ -331,9 +330,14 @@ class TransformerEDADiarization(Module):
                 torch.stack([e[order] for e, order in zip(emb, orders)]))
         else:
             attractors, probs = self.eda.estimate(emb)
+        #  B x T x max_n_speakers
         ys = torch.matmul(emb, attractors.permute(0, 2, 1))
         ys = [torch.sigmoid(y) for y in ys]
         for p, y in zip(probs, ys):
+            """
+            p: T
+            y: T x max_n_speakers
+            """
             if args.estimate_spk_qty != -1:
                 sorted_p, order = torch.sort(p, descending=True)
                 ys_active.append(y[:, order[:args.estimate_spk_qty]])
@@ -356,6 +360,7 @@ class TransformerEDADiarization(Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.get_embeddings(xs)
 
+        # In this step, the padded part is also shuffled
         if args.time_shuffle:
             orders = [np.arange(e.shape[0]) for e in emb]
             for order in orders:
@@ -450,7 +455,7 @@ def save_checkpoint(
 
     torch.save({
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss},
         f"{args.output_path}/models/checkpoint_{epoch}.tar"
