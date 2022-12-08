@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # Copyright 2022 Brno University of Technology (author: Federico Landini, Mireia Diez)
+# Copyright 2022 Shanghai Jiao Tong University (authors: Zhengyang Chen)
 # Licensed under the MIT license.
 
 from typing import Dict
@@ -20,6 +21,7 @@ def calculate_metrics(
     res["avg_pred_spk_qty"] = 0
     res["DER_FA"] = 0
     res["DER_miss"] = 0
+    res["DER_conf"] = 0
     res["VAD_FA"] = 0
     res["VAD_miss"] = 0
     res["OSD_FA"] = 0
@@ -34,14 +36,18 @@ def calculate_metrics(
     for seq_num in range(target.shape[0]):
         t_seq = target[seq_num, :, :]
         mask = (t_seq != -1)
+        spk_num = torch.sum(mask, dim=-1).max()
+        # T_valid x spk_num
         t_seq = torch.reshape(
-            torch.masked_select(t_seq, mask), (-1, t_seq.shape[1]))
+            torch.masked_select(t_seq, mask), (-1, spk_num))
         d_seq = decisions[seq_num, :, :]
+        # T_valid x spk_num
         d_seq = torch.reshape(
-            torch.masked_select(d_seq, mask), (-1, d_seq.shape[1]))
+            torch.masked_select(d_seq, mask), (-1, spk_num))
 
-        ref_spk_qty = t_seq.sum(axis=1)
-        pred_spk_qty = d_seq.sum(axis=1)
+        ref_spk_qty = t_seq.sum(axis=1)  # T_valid
+        pred_spk_qty = d_seq.sum(axis=1)  # T_valid
+        correct_spk_qty = torch.logical_and(t_seq>0.5, d_seq>0.5).sum(axis=1)  # T_valid
         res["avg_ref_spk_qty"] += torch.mean(ref_spk_qty.double())
         res["avg_pred_spk_qty"] += torch.mean(pred_spk_qty.double())
         # active_frames has frames where at least one speaker is active
@@ -57,6 +63,7 @@ def calculate_metrics(
         diff_qty = pred_spk_qty - ref_spk_qty
         res["DER_FA"] += diff_qty[torch.where(diff_qty > 0)].sum()
         res["DER_miss"] += -diff_qty[torch.where(diff_qty < 0)].sum()
+        res["DER_conf"] += (torch.minimum(ref_spk_qty, pred_spk_qty) - correct_spk_qty).sum()
         # conf. error not calculated as computing all permutations is expensive
         # TODO use Hungarian algorithm?
 
@@ -69,6 +76,7 @@ def calculate_metrics(
     # divide by the numerators estimated in the whole batch
     res["DER_FA"] = torch.round(100 * res["DER_FA"] / (epsilon + speech_frames_tot) * 10**round_digits / (10**round_digits))
     res["DER_miss"] = torch.round(100 * res["DER_miss"] / (epsilon + speech_frames_tot) * 10**round_digits / (10**round_digits))
+    res["DER_conf"] = torch.round(100 * res["DER_conf"] / (epsilon + speech_frames_tot) * 10**round_digits / (10**round_digits))
     res["VAD_FA"] = round(100 * res["VAD_FA"] / (epsilon + active_frames_tot), 2)
     res["VAD_miss"] = round(100 * res["VAD_miss"] / (epsilon + active_frames_tot), 2)
     res["OSD_FA"] = round(100 * res["OSD_FA"] / (epsilon + overlap_frames_tot), 2)
@@ -89,6 +97,7 @@ def new_metrics() -> Dict[str, float]:
         'avg_pred_spk_qty',
         'DER_FA',
         'DER_miss',
+        'DER_conf',
         'VAD_FA',
         'VAD_miss',
         'OSD_FA',

@@ -2,6 +2,7 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (authors: Federico Landini)
+# Copyright 2022 Shanghai Jiao Tong University (authors: Zhengyang Chen)
 # Licensed under the MIT license.
 
 
@@ -22,6 +23,7 @@ from common_utils.metrics import (
     reset_metrics,
     update_metrics,
 )
+from common_utils.logger_setup import get_logger, get_log_info
 from common_utils.ddp_utils import init_ddp
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -34,11 +36,8 @@ import numpy as np
 import os
 import random
 import torch
-import logging
 import yamlargparse
 from tqdm import tqdm
-
-logging.getLogger().setLevel(logging.INFO)
 
 
 def _init_fn(worker_id):
@@ -64,12 +63,12 @@ def compute_loss_and_metrics(
     vad_loss_weight: float,
     detach_attractor_loss: bool
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    # y_pred: B x T x max_n_speakers 
     y_pred, attractor_loss = model(input, labels, n_speakers, args)
-    loss, standard_loss = model.module.get_loss(
-        y_pred, labels, n_speakers, attractor_loss, vad_loss_weight,
-        detach_attractor_loss)
+    loss, standard_loss, permute_labels = model.module.get_loss(
+        y_pred, labels, n_speakers, attractor_loss, vad_loss_weight)
     metrics = calculate_metrics(
-        labels.detach(), y_pred.detach(), threshold=0.5)
+        permute_labels.detach(), y_pred.detach(), threshold=0.5)
     acum_metrics = update_metrics(acum_metrics, metrics)
     acum_metrics['loss'] += loss.item()
     acum_metrics['loss_standard'] += standard_loss.item()
@@ -167,7 +166,7 @@ def parse_arguments() -> SimpleNamespace:
                         choices=['logmel', 'logmel_meannorm',
                                  'logmel_meanvarnorm'],
                         help='input normalization transform')
-    parser.add_argument('--log-report-batches-num', default=1, type=float)
+    parser.add_argument('--log-report-batches-ratio', default=0.0, type=float)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--max-epochs', type=int,
                         help='Max. number of epochs to train')
@@ -179,7 +178,7 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--noam-warmup-steps', default=100000, type=float)
     parser.add_argument('--num-frames', default=500, type=int,
                         help='number of frames in one utterance')
-    parser.add_argument('--num-speakers', type=int,
+    parser.add_argument('--num-speakers',
                         help='maximum number of speakers allowed')
     parser.add_argument('--num-workers', default=1, type=int,
                         help='number of workers in train DataLoader')
@@ -229,7 +228,8 @@ if __name__ == '__main__':
     args.gpu_id = init_ddp(args.gpus)
 
     # some post processing based on the parameter setting
-    args.noam_warmup_steps = int(args.noam_warmup_steps / (dist.get_world_size() * args.train_batchsize / 32.0))
+    scale_ratio = dist.get_world_size() * args.train_batchsize / 32.0
+    args.noam_warmup_steps = int(args.noam_warmup_steps / scale_ratio)
 
     # For reproducibility
     torch.manual_seed(args.seed)
@@ -243,8 +243,19 @@ if __name__ == '__main__':
     torch.backends.cudnn.deterministic = True
     os.environ['PYTHONHASHSEED'] = str(args.seed)
 
+    # setup logger
     if dist.get_rank() == 0:
-        logging.info(args)
+        os.makedirs(args.output_path, exist_ok=True)
+        logger = get_logger(os.path.join(args.output_path, 'exp.log')
+                            , "[ %(asctime)s ] %(message)s", log_console=False)
+    dist.barrier(device_ids=[args.gpu_id])  # let the rank 0 mkdir first
+    if dist.get_rank() != 0:
+        logger = get_logger(os.path.join(args.output_path, 'exp.log')
+                            , "[ %(asctime)s ] %(message)s", log_console=False)
+
+
+    if dist.get_rank() == 0:
+        logger.info(args)
 
     writer = SummaryWriter(f"{args.output_path}/tensorboard")
 
@@ -259,13 +270,14 @@ if __name__ == '__main__':
     else:
         model = get_model(args)
         model = average_checkpoints(
-            args.device, model, args.init_model_path, args.init_epochs)
+            model, args.init_model_path, args.init_epochs)
         optimizer = setup_optimizer(args, model)
 
     train_batches_qty = len(train_loader)
     dev_batches_qty = len(dev_loader)
-    logging.info("Rank: {} has {} batches quantity for train".format(dist.get_rank(), train_batches_qty))
-    logging.info("Rank: {} has {} batches quantity for dev".format(dist.get_rank(), dev_batches_qty))
+    logger.info("Rank: {} has {} batches quantity for train".format(dist.get_rank(), train_batches_qty))
+    logger.info("Rank: {} has {} batches quantity for dev".format(dist.get_rank(), dev_batches_qty))
+    args.log_report_batches_num = max(int(train_batches_qty * args.log_report_batches_ratio), 1)
 
     acum_train_metrics = new_metrics()
     acum_dev_metrics = new_metrics()
@@ -285,9 +297,6 @@ if __name__ == '__main__':
         # Save initial model
         save_checkpoint(args, init_epoch, model, optimizer, 0)
 
-    for name, param in model.named_parameters():
-        if 'lnorm_in' in name:
-            param.requires_grad = False
     model = model.to(args.device)
     model = DDP(model, device_ids=[args.gpu_id], output_device=args.gpu_id)
 
@@ -310,7 +319,9 @@ if __name__ == '__main__':
             # the padding value is -1 here, which can be used to denote the each chunk length
             features, labels = pad_sequence(features, labels, args.num_frames)
             labels = pad_labels(labels, max_n_speakers)
+            # features: B x T x feat_dim
             features = torch.stack(features).to(args.device)
+            # labels: B x T x max_n_speakers 
             labels = torch.stack(labels).to(args.device)
             loss, acum_train_metrics = compute_loss_and_metrics(
                 model, labels, features, n_speakers, acum_train_metrics,
@@ -327,6 +338,13 @@ if __name__ == '__main__':
                     "lrate",
                     get_rate(optimizer),
                     epoch * train_batches_qty + i)
+                logger.info(get_log_info(dist.get_rank(),
+                                         epoch,
+                                         i,
+                                         {key: val/args.log_report_batches_num for key, val in acum_train_metrics.items()},
+                                         get_rate(optimizer),
+                                         'Train'
+                                         ))
                 acum_train_metrics = reset_metrics(acum_train_metrics)
             optimizer.zero_grad()
             loss.backward()
@@ -358,4 +376,11 @@ if __name__ == '__main__':
             writer.add_scalar(
                 f"rank-{dist.get_rank()}-dev_{k}", acum_dev_metrics[k] / dev_batches_qty,
                 epoch * dev_batches_qty + i)
+        logger.info(get_log_info(dist.get_rank(),
+                                 epoch,
+                                 i,
+                                 {key: val/args.log_report_batches_num for key, val in acum_dev_metrics.items()},
+                                 get_rate(optimizer),
+                                 'Dev'
+                                 ))
         acum_dev_metrics = reset_metrics(acum_dev_metrics)

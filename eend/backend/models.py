@@ -2,6 +2,7 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2022 Shanghai Jiao Tong University (authors: Zhengyang Chen)
 # Licensed under the MIT license.
 
 from os.path import isfile, join
@@ -23,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-import logging
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 """
@@ -37,44 +38,41 @@ B: mini-batch size
 class EncoderDecoderAttractor(Module):
     def __init__(
         self,
-        device: torch.device,
         n_units: int,
         encoder_dropout: float,
         decoder_dropout: float,
         detach_attractor_loss: bool,
     ) -> None:
         super(EncoderDecoderAttractor, self).__init__()
-        self.device = device
         self.encoder = torch.nn.LSTM(
             input_size=n_units,
             hidden_size=n_units,
             num_layers=1,
             dropout=encoder_dropout,
             batch_first=True,
-            device=self.device)
+            )
         self.decoder = torch.nn.LSTM(
             input_size=n_units,
             hidden_size=n_units,
             num_layers=1,
             dropout=decoder_dropout,
             batch_first=True,
-            device=self.device)
-        self.counter = torch.nn.Linear(n_units, 1, device=self.device)
+            )
+        self.counter = torch.nn.Linear(n_units, 1)
         self.n_units = n_units
         self.detach_attractor_loss = detach_attractor_loss
 
     def forward(self, xs: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
-        _, (hx, cx) = self.encoder.to(self.device)(xs.to(self.device))
-        attractors, (_, _) = self.decoder.to(self.device)(
-            zeros.to(self.device),
-            (hx.to(self.device), cx.to(self.device))
-        )
+        _, h_c = self.encoder(xs)
+        # attractors: (B, max_n_speakers, E)
+        attractors, (_, _) = self.decoder(zeros, h_c)
         return attractors
 
     def estimate(
         self,
         xs: torch.Tensor,
-        max_n_speakers: int = 15
+        max_n_speakers: int = 15,
+        time_shuffle: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate attractors from embedding sequences
@@ -82,55 +80,76 @@ class EncoderDecoderAttractor(Module):
         Args:
           xs: List of (T,D)-shaped embeddings
           max_n_speakers (int)
+          time_shuffle: whether to shuffle the embedding input
         Returns:
           attractors: List of (N,D)-shaped attractors
           probs: List of attractor existence probabilities
         """
         zeros = torch.zeros((xs.shape[0], max_n_speakers, self.n_units))
-        attractors = self.forward(xs, zeros)
-        probs = [torch.sigmoid(
-            torch.flatten(self.counter.to(self.device)(att)))
-            for att in attractors]
+        if time_shuffle:
+            orders = [np.arange(x.shape[0]) for x in xs]
+            for order in orders:
+                np.random.shuffle(order)
+            shuf_xs = torch.stack([x[order] for x, order in zip(xs, orders)])
+            attractors = self.forward(shuf_xs, zeros)
+        else:
+            # attractors: (B, max_n_speakers, E)
+            attractors = self.forward(xs, zeros)
+        # probs: (B, max_n_speakers)
+        probs = torch.sigmoid(self.counter(attractors)).squeeze(-1)
         return attractors, probs
 
     def __call__(
         self,
         xs: torch.Tensor,
-        n_speakers: List[int]
+        n_speakers: List[int],
+        emb_lens: List[int],
+        time_shuffle: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate attractors and loss from embedding sequences
         with given number of speakers
         Args:
-          xs: List of (T,D)-shaped embeddings
+          xs: (B,T,D)-shaped embeddings
           n_speakers: List of number of speakers, or None if the number
                                 of speakers is unknown (ex. test phase)
+        emb_lens: the real length of each embedding sequence
+        time_shuffle: whether to shuffle the embedding input
         Returns:
           loss: Attractor existence loss
           attractors: List of (N,D)-shaped attractors
         """
 
         max_n_speakers = max(n_speakers)
-        if self.device == torch.device("cpu"):
-            zeros = torch.zeros(
-                (xs.shape[0], max_n_speakers + 1, self.n_units))
-            labels = torch.from_numpy(np.asarray([
-                [1.0] * n_spk + [0.0] * (1 + max_n_speakers - n_spk)
-                for n_spk in n_speakers]))
-        else:
-            zeros = torch.zeros(
-                (xs.shape[0], max_n_speakers + 1, self.n_units),
-                device=torch.device("cuda"))
-            labels = torch.from_numpy(np.asarray([
-                [1.0] * n_spk + [0.0] * (1 + max_n_speakers - n_spk)
-                for n_spk in n_speakers])).to(torch.device("cuda"))
+        zeros = torch.zeros(
+            (xs.shape[0], max_n_speakers + 1, self.n_units),
+            device=xs.device)
+        labels = torch.from_numpy(np.asarray([
+            [1.0] * n_spk + [0.0] * (1 + max_n_speakers - n_spk)
+            for n_spk in n_speakers])).to(xs.device)
 
-        attractors = self.forward(xs, zeros)
+        if time_shuffle:
+            orders = []
+            max_emb_len = xs.shape[1]
+            for emb_len in emb_lens:
+                tmp_array = np.arange(max_emb_len)
+                shuffle_array = np.arange(emb_len)
+                np.random.shuffle(shuffle_array)
+                tmp_array[:emb_len] = shuffle_array
+                orders.append(tmp_array)
+            shuf_xs = torch.stack([x[order] for x, order in zip(xs, orders)])
+            packed_xs = pack_padded_sequence(shuf_xs, emb_lens, batch_first=True, enforce_sorted=False)
+            attractors = self.forward(packed_xs, zeros)
+        else:
+            # attractors: (B, max_n_speakers + 1, E)
+            attractors = self.forward(xs, zeros)
+
+        # tmp_attractors is used for attractor loss calculation
+        tmp_attractors = attractors
         if self.detach_attractor_loss:
-            attractors = attractors.detach()
-        logit = torch.cat([
-            torch.reshape(self.counter(att), (-1, max_n_speakers + 1))
-            for att, n_spk in zip(attractors, n_speakers)])
+            tmp_attractors = attractors.detach()
+
+        logit = self.counter(tmp_attractors).squeeze(-1)
         loss = F.binary_cross_entropy_with_logits(logit, labels)
 
         # The final attractor does not correspond to a speaker so remove it
@@ -143,17 +162,15 @@ class MultiHeadSelfAttention(Module):
     """
     def __init__(
         self,
-        device: torch.device,
         n_units: int,
         h: int,
         dropout: float
     ) -> None:
         super(MultiHeadSelfAttention, self).__init__()
-        self.device = device
-        self.linearQ = torch.nn.Linear(n_units, n_units, device=self.device)
-        self.linearK = torch.nn.Linear(n_units, n_units, device=self.device)
-        self.linearV = torch.nn.Linear(n_units, n_units, device=self.device)
-        self.linearO = torch.nn.Linear(n_units, n_units, device=self.device)
+        self.linearQ = torch.nn.Linear(n_units, n_units)
+        self.linearK = torch.nn.Linear(n_units, n_units)
+        self.linearV = torch.nn.Linear(n_units, n_units)
+        self.linearO = torch.nn.Linear(n_units, n_units)
         self.d_k = n_units // h
         self.h = h
         self.dropout = dropout
@@ -179,15 +196,13 @@ class PositionwiseFeedForward(Module):
     """
     def __init__(
         self,
-        device: torch.device,
         n_units: int,
         d_units: int,
         dropout: float
     ) -> None:
         super(PositionwiseFeedForward, self).__init__()
-        self.device = device
-        self.linear1 = torch.nn.Linear(n_units, d_units, device=self.device)
-        self.linear2 = torch.nn.Linear(d_units, n_units, device=self.device)
+        self.linear1 = torch.nn.Linear(n_units, d_units)
+        self.linear2 = torch.nn.Linear(d_units, n_units)
         self.dropout = dropout
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -197,7 +212,6 @@ class PositionwiseFeedForward(Module):
 class TransformerEncoder(Module):
     def __init__(
         self,
-        device: torch.device,
         idim: int,
         n_layers: int,
         n_units: int,
@@ -206,33 +220,31 @@ class TransformerEncoder(Module):
         dropout: float
     ) -> None:
         super(TransformerEncoder, self).__init__()
-        self.device = device
-        self.linear_in = torch.nn.Linear(idim, n_units, device=self.device)
-        self.lnorm_in = torch.nn.LayerNorm(n_units, device=self.device)
+        self.linear_in = torch.nn.Linear(idim, n_units)
         self.n_layers = n_layers
         self.dropout = dropout
         for i in range(n_layers):
             setattr(
                 self,
                 '{}{:d}'.format("lnorm1_", i),
-                torch.nn.LayerNorm(n_units, device=self.device)
+                torch.nn.LayerNorm(n_units)
             )
             setattr(
                 self,
                 '{}{:d}'.format("self_att_", i),
-                MultiHeadSelfAttention(self.device, n_units, h, dropout)
+                MultiHeadSelfAttention(n_units, h, dropout)
             )
             setattr(
                 self,
                 '{}{:d}'.format("lnorm2_", i),
-                torch.nn.LayerNorm(n_units, device=self.device)
+                torch.nn.LayerNorm(n_units)
             )
             setattr(
                 self,
                 '{}{:d}'.format("ff_", i),
-                PositionwiseFeedForward(self.device, n_units, e_units, dropout)
+                PositionwiseFeedForward(n_units, e_units, dropout)
             )
-        self.lnorm_out = torch.nn.LayerNorm(n_units, device=self.device)
+        self.lnorm_out = torch.nn.LayerNorm(n_units)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, F) ... batch, time, (mel)freq
@@ -262,7 +274,6 @@ class TransformerEDADiarization(Module):
 
     def __init__(
         self,
-        device: torch.device,
         in_size: int,
         n_units: int,
         e_units: int,
@@ -287,13 +298,11 @@ class TransformerEDADiarization(Module):
           attractor_encoder_dropout (float)
           attractor_decoder_dropout (float)
         """
-        self.device = device
         super(TransformerEDADiarization, self).__init__()
         self.enc = TransformerEncoder(
-            self.device, in_size, n_layers, n_units, e_units, n_heads, dropout
+            in_size, n_layers, n_units, e_units, n_heads, dropout
         )
         self.eda = EncoderDecoderAttractor(
-            self.device,
             n_units,
             attractor_encoder_dropout,
             attractor_decoder_dropout,
@@ -316,26 +325,26 @@ class TransformerEDADiarization(Module):
         xs: torch.Tensor,
         args: SimpleNamespace
     ) -> List[torch.Tensor]:
+        """
+        Used in inference stage
+        """
         assert args.estimate_spk_qty_thr != -1 or \
             args.estimate_spk_qty != -1, \
             "Either 'estimate_spk_qty_thr' or 'estimate_spk_qty' \
             arguments have to be defined."
+        # emb: (B, T, E)
         emb = self.get_embeddings(xs)
         ys_active = []
-        if args.time_shuffle:
-            orders = [np.arange(e.shape[0]) for e in emb]
-            for order in orders:
-                np.random.shuffle(order)
-            attractors, probs = self.eda.estimate(
-                torch.stack([e[order] for e, order in zip(emb, orders)]))
-        else:
-            attractors, probs = self.eda.estimate(emb)
-        #  B x T x max_n_speakers
+        # attractors: (B, max_n_speakers, E)
+        # probs: (B, max_n_speakers)
+        attractors, probs = self.eda.estimate(emb, time_shuffle=args.time_shuffle)
+
+        # ys: B x T x max_n_speakers 
         ys = torch.matmul(emb, attractors.permute(0, 2, 1))
-        ys = [torch.sigmoid(y) for y in ys]
+        ys = torch.sigmoid(ys)
         for p, y in zip(probs, ys):
             """
-            p: T
+            p: max_n_speakers
             y: T x max_n_speakers
             """
             if args.estimate_spk_qty != -1:
@@ -358,20 +367,17 @@ class TransformerEDADiarization(Module):
         n_speakers: List[int],
         args: SimpleNamespace
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # emb: (B, T, E)
         emb = self.get_embeddings(xs)
+        real_emb_lens = ((ts != -1).sum(-1) != 0).sum(-1).tolist()
 
-        # In this step, the padded part is also shuffled
-        if args.time_shuffle:
-            orders = [np.arange(e.shape[0]) for e in emb]
-            for order in orders:
-                np.random.shuffle(order)
-            attractor_loss, attractors = self.eda(
-                torch.stack([e[order] for e, order in zip(emb, orders)]),
-                n_speakers)
-        else:
-            attractor_loss, attractors = self.eda(emb, n_speakers)
+        attractor_loss, attractors = self.eda(emb,
+                                              n_speakers,
+                                              real_emb_lens,
+                                              args.time_shuffle,
+                                              )
 
-        # ys: [(T, C), ...]
+        # ys: B x T x max_n_speakers 
         ys = torch.matmul(emb, attractors.permute(0, 2, 1))
         return ys, attractor_loss
 
@@ -382,20 +388,15 @@ class TransformerEDADiarization(Module):
         n_speakers: List[int],
         attractor_loss: torch.Tensor,
         vad_loss_weight: float,
-        detach_attractor_loss: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_n_speakers = max(n_speakers)
-        ts_padded = pad_labels(target, max_n_speakers)
-        ts_padded = torch.stack(ts_padded)
-        ys_padded = pad_labels(ys, max_n_speakers)
-        ys_padded = torch.stack(ys_padded)
 
-        loss = pit_loss_multispk(
-            ys_padded, ts_padded, n_speakers, detach_attractor_loss)
+        loss, permute_target = pit_loss_multispk(
+            ys, target, n_speakers)
         vad_loss_value = vad_loss(ys, target)
 
         return loss + vad_loss_value * vad_loss_weight + \
-            attractor_loss * self.attractor_loss_ratio, loss
+            attractor_loss * self.attractor_loss_ratio, loss, permute_target
 
 
 def pad_labels(ts: torch.Tensor, out_size: int) -> torch.Tensor:
@@ -483,7 +484,6 @@ def load_initmodel(args: SimpleNamespace):
 def get_model(args: SimpleNamespace) -> Module:
     if args.model_type == 'TransformerEDA':
         model = TransformerEDADiarization(
-            device=args.device,
             in_size=args.feature_dim * (1 + 2 * args.context_size),
             n_units=args.hidden_size,
             e_units=args.encoder_units,
@@ -502,7 +502,6 @@ def get_model(args: SimpleNamespace) -> Module:
 
 
 def average_checkpoints(
-    device: torch.device,
     model: Module,
     models_path: str,
     epochs: str
@@ -513,10 +512,10 @@ def average_checkpoints(
         copy_model = copy.deepcopy(model)
         checkpoint = torch.load(join(
             models_path,
-            f"checkpoint_{e}.tar"), map_location=device)
+            f"checkpoint_{e}.tar"), map_location=lambda storage, loc: storage)
         copy_model.load_state_dict(checkpoint['model_state_dict'])
         states_dict_list.append(copy_model.state_dict())
-    avg_state_dict = average_states(states_dict_list, device)
+    avg_state_dict = average_states(states_dict_list)
     avg_model = copy.deepcopy(model)
     avg_model.load_state_dict(avg_state_dict)
     return avg_model
@@ -524,13 +523,12 @@ def average_checkpoints(
 
 def average_states(
     states_list: List[Dict[str, torch.Tensor]],
-    device: torch.device,
 ) -> List[Dict[str, torch.Tensor]]:
     qty = len(states_list)
     avg_state = states_list[0]
     for i in range(1, qty):
         for key in avg_state:
-            avg_state[key] += states_list[i][key].to(device)
+            avg_state[key] += states_list[i][key]
 
     for key in avg_state:
         avg_state[key] = avg_state[key] / qty

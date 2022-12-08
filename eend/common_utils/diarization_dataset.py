@@ -9,7 +9,6 @@ import common_utils.kaldi_data as kaldi_data
 import numpy as np
 import torch
 from typing import Tuple
-import logging
 
 
 def _count_frames(data_len: int, size: int, step: int) -> int:
@@ -83,8 +82,6 @@ class KaldiDiarizationDataset(torch.utils.data.Dataset):
             else:
                 self.chunk_indices.append(
                     (rec, 0, data_len * self.subsampling))
-        logging.info(f"#files: {len(self.data.wavs)}, "
-                     "#chunks: {len(self.chunk_indices)}")
 
         self.shuffle = shuffle
 

@@ -16,12 +16,7 @@ from scipy.optimize import linear_sum_assignment
 
 def pit_loss_multispk(
         logits: List[torch.Tensor], target: List[torch.Tensor],
-        n_speakers: np.ndarray, detach_attractor_loss: bool):
-    if detach_attractor_loss:
-        # -1's for speakers that do not have valid attractor
-        for i in range(target.shape[0]):
-            target[i, :, n_speakers[i]:] = -1 * torch.ones(
-                          target.shape[1], target.shape[2]-n_speakers[i])
+        n_speakers: np.ndarray):
 
     logits_t = logits.detach().transpose(1, 2)
     cost_mxs = -logsigmoid(logits_t).bmm(target) - logsigmoid(-logits_t).bmm(1-target)
@@ -33,6 +28,7 @@ def pit_loss_multispk(
             max_value = np.absolute(cost_mx).sum()
             cost_mx[-(max_n_speakers-n_speakers[i]):] = max_value
             cost_mx[:, -(max_n_speakers-n_speakers[i]):] = max_value
+        # use Hungarian algorithm to solve Bipartite graph problem
         pred_alig, ref_alig = linear_sum_assignment(cost_mx)
         assert (np.all(pred_alig == np.arange(logits.shape[-1])))
         target[i, :] = target[i, :, ref_alig]
@@ -41,13 +37,11 @@ def pit_loss_multispk(
 
     loss[torch.where(target == -1)] = 0
     # normalize by sequence length
-    loss = torch.sum(loss, axis=1) / (target != -1).sum(axis=1)
-    for i in range(target.shape[0]):
-        loss[i, n_speakers[i]:] = torch.zeros(loss.shape[1]-n_speakers[i])
+    loss = torch.sum(loss, axis=1) / ((target != -1).sum(axis=1) + 1e-7)
 
     # normalize in batch for all speakers
     loss = torch.mean(loss)
-    return loss
+    return loss, target
 
 
 def vad_loss(ys: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:

@@ -10,11 +10,11 @@ feature_dim: 23
 frame_shift: 80
 frame_size: 200
 use_last_samples: True
-gpu: 1
+gpus: 0
 gradclip: 5
 hidden_size: 256
 input_transform: logmel_meannorm
-log_report_batches_num: 1000
+log_report_batches_ratio: 0.25
 max_epochs: 100
 model_type: TransformerEDA
 noam_warmup_steps: 200000

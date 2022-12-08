@@ -152,8 +152,6 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--feature-dim', type=int)
     parser.add_argument('--frame-size', type=int)
     parser.add_argument('--frame-shift', type=int)
-    parser.add_argument('--gpu', '-g', default=-1, type=int,
-                        help='GPU ID (negative value indicates CPU)')
     parser.add_argument('--hidden-size', type=int,
                         help='number of units in SA blocks')
     parser.add_argument('--infer-data-dir', help='inference data directory.')
@@ -197,6 +195,9 @@ def parse_arguments() -> SimpleNamespace:
     attractor_args.add_argument(
         '--detach-attractor-loss', default=False, type=bool,
         help='If True, avoid backpropagation on attractor loss')
+
+    parser.add_argument('-g','--gpus', nargs='+', default=[0],
+                        help='gpu id list for each process of ddp')
     args = parser.parse_args()
     return args
 
@@ -219,13 +220,9 @@ if __name__ == '__main__':
 
     infer_loader = get_infer_dataloader(args)
 
-    if args.gpu >= 1:
-        gpuid = use_single_gpu(args.gpu)
-        logging.info('GPU device {} is used'.format(gpuid))
-        args.device = torch.device("cuda")
-    else:
-        gpuid = -1
-        args.device = torch.device("cpu")
+    gpu_id = args.gpus if isinstance(args.gpus, int) else int(args.gpus[0])
+    torch.cuda.set_device(gpu_id)
+    args.device = torch.device("cuda")
 
     assert args.estimate_spk_qty_thr != -1 or \
         args.estimate_spk_qty != -1, \
@@ -241,7 +238,7 @@ if __name__ == '__main__':
     model = get_model(args)
 
     model = average_checkpoints(
-        args.device, model, args.models_path, args.epochs)
+        model, args.models_path, args.epochs)
     model.eval()
 
     out_dir = join(

@@ -22,6 +22,8 @@ def dist_init(host_addr, rank, local_rank, world_size, port=23456):
 
 
 def init_ddp(gpu_list='[0]'):
+    if isinstance(gpu_list, int):
+        gpu_list = [gpu_list]
 
     if 'WORLD_SIZE' in os.environ:
         # using torchrun to start:
