@@ -127,6 +127,9 @@ class EncoderDecoderAttractor(Module):
         labels = torch.from_numpy(np.asarray([
             [1.0] * n_spk + [0.0] * (1 + max_n_speakers - n_spk)
             for n_spk in n_speakers])).to(xs.device)
+        loss_mask = torch.from_numpy(np.asarray([
+            [1.0] * (n_spk + 1) + [0.0] * (max_n_speakers - n_spk)
+            for n_spk in n_speakers])).to(xs.device)
 
         if time_shuffle:
             orders = []
@@ -150,7 +153,8 @@ class EncoderDecoderAttractor(Module):
             tmp_attractors = attractors.detach()
 
         logit = self.counter(tmp_attractors).squeeze(-1)
-        loss = F.binary_cross_entropy_with_logits(logit, labels)
+        loss = F.binary_cross_entropy_with_logits(logit, labels, reduction='none') * loss_mask
+        loss = torch.sum(loss) / torch.sum(loss_mask)
 
         # The final attractor does not correspond to a speaker so remove it
         attractors = attractors[:, :-1, :]

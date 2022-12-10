@@ -35,12 +35,10 @@ def pit_loss_multispk(
     loss = torch.nn.functional.binary_cross_entropy_with_logits(
              logits, target, reduction='none')
 
-    loss[torch.where(target == -1)] = 0
-    # normalize by sequence length
-    loss = torch.sum(loss, axis=1) / ((target != -1).sum(axis=1) + 1e-7)
+    loss_mask = (target != -1) * 1.0
+    loss = loss * loss_mask
+    loss = torch.sum(loss) / torch.sum(loss_mask)
 
-    # normalize in batch for all speakers
-    loss = torch.mean(loss)
     return loss, target
 
 

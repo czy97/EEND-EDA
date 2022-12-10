@@ -379,7 +379,7 @@ if __name__ == '__main__':
         logger.info(get_log_info(dist.get_rank(),
                                  epoch,
                                  i,
-                                 {key: val/args.log_report_batches_num for key, val in acum_dev_metrics.items()},
+                                 {key: val/dev_batches_qty for key, val in acum_dev_metrics.items()},
                                  get_rate(optimizer),
                                  'Dev'
                                  ))
