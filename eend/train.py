@@ -12,6 +12,7 @@ from backend.models import (
     load_checkpoint,
     pad_labels,
     pad_sequence,
+    process_non_exist_spk,
     save_checkpoint,
 )
 from backend.updater import setup_optimizer, get_rate
@@ -93,6 +94,7 @@ def get_training_dataloaders(
         subsampling=args.subsampling,
         use_last_samples=args.use_last_samples,
         min_length=args.min_length,
+        read_feat=args.read_feat,
     )
     train_sampler = DistributedSampler(train_set, shuffle=True)
     train_loader = DataLoader(
@@ -118,6 +120,7 @@ def get_training_dataloaders(
         subsampling=args.subsampling,
         use_last_samples=args.use_last_samples,
         min_length=args.min_length,
+        read_feat=args.read_feat,
     )
     dev_loader = DataLoader(
         dev_set,
@@ -173,6 +176,7 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--min-length', default=0, type=int,
                         help='Minimum number of frames for the sequences'
                              ' after downsampling.')
+    parser.add_argument('--read-feat', default=False, type=bool)
     parser.add_argument('--model-type', default='TransformerEDA',
                         help='Type of model (for now only TransformerEDA)')
     parser.add_argument('--noam-warmup-steps', default=100000, type=float)
@@ -313,12 +317,13 @@ if __name__ == '__main__':
 
             features = batch['xs']
             labels = batch['ts']
-            n_speakers = np.asarray([max(torch.where(t.sum(0) != 0)[0]) + 1
+            n_speakers = np.asarray([(t.sum(0) != 0).sum().item()
                                      if t.sum() > 0 else 0 for t in labels])
             max_n_speakers = max(n_speakers)
             # the padding value is -1 here, which can be used to denote the each chunk length
             features, labels = pad_sequence(features, labels, args.num_frames)
             labels = pad_labels(labels, max_n_speakers)
+            labels = process_non_exist_spk(labels)
             # features: B x T x feat_dim
             features = torch.stack(features).to(args.device)
             # labels: B x T x max_n_speakers 
@@ -360,12 +365,13 @@ if __name__ == '__main__':
             for i, batch in enumerate(dev_loader):
                 features = batch['xs']
                 labels = batch['ts']
-                n_speakers = np.asarray([max(torch.where(t.sum(0) != 0)[0]) + 1
-                                        if t.sum() > 0 else 0 for t in labels])
+                n_speakers = np.asarray([(t.sum(0) != 0).sum().item()
+                                     if t.sum() > 0 else 0 for t in labels])
                 max_n_speakers = max(n_speakers)
                 features, labels = pad_sequence(
                     features, labels, args.num_frames)
                 labels = pad_labels(labels, max_n_speakers)
+                labels = process_non_exist_spk(labels)
                 features = torch.stack(features).to(args.device)
                 labels = torch.stack(labels).to(args.device)
                 _, acum_dev_metrics = compute_loss_and_metrics(

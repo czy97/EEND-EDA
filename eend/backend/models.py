@@ -123,13 +123,13 @@ class EncoderDecoderAttractor(Module):
         max_n_speakers = max(n_speakers)
         zeros = torch.zeros(
             (xs.shape[0], max_n_speakers + 1, self.n_units),
-            device=xs.device)
+            device=xs.device).float()
         labels = torch.from_numpy(np.asarray([
             [1.0] * n_spk + [0.0] * (1 + max_n_speakers - n_spk)
-            for n_spk in n_speakers])).to(xs.device)
+            for n_spk in n_speakers])).float().to(xs.device)
         loss_mask = torch.from_numpy(np.asarray([
             [1.0] * (n_spk + 1) + [0.0] * (max_n_speakers - n_spk)
-            for n_spk in n_speakers])).to(xs.device)
+            for n_spk in n_speakers])).float().to(xs.device)
 
         if time_shuffle:
             orders = []
@@ -373,7 +373,7 @@ class TransformerEDADiarization(Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # emb: (B, T, E)
         emb = self.get_embeddings(xs)
-        real_emb_lens = ((ts != -1).sum(-1) != 0).sum(-1).tolist()
+        real_emb_lens = ((xs != -1).sum(-1) != 0).sum(-1).tolist()
 
         attractor_loss, attractors = self.eda(emb,
                                               n_speakers,
@@ -397,11 +397,31 @@ class TransformerEDADiarization(Module):
 
         loss, permute_target = pit_loss_multispk(
             ys, target, n_speakers)
-        vad_loss_value = vad_loss(ys, target)
+        vad_loss_value = vad_loss(ys, permute_target)
 
         return loss + vad_loss_value * vad_loss_weight + \
             attractor_loss * self.attractor_loss_ratio, loss, permute_target
 
+def process_non_exist_spk(ts: torch.Tensor) -> torch.Tensor:
+    '''
+    In the dataset, the speaker number is decided by the whole recoding not the segment.
+    Thus, the speaker number in the segment may be less than the whole recoding.
+
+    I the label array, There will be all zeros vector for some speaker.
+    Here, we will fill all zeros vector to all -1 vector.
+    '''
+    ts_process = []
+
+    for t in ts:
+        max_val, _ = torch.max(t, dim=0)
+        max_val, sort_idx = torch.sort(max_val, stable=True, descending=True)
+        t = t[:, sort_idx]
+        for i, sub_max_val in enumerate(max_val):
+            if sub_max_val < 0.5:
+                t[:, i] = torch.ones(t.shape[0]) * -1
+        ts_process.append(t.float())
+
+    return ts_process
 
 def pad_labels(ts: torch.Tensor, out_size: int) -> torch.Tensor:
     # pad label's speaker-dim to be model's n_speakers

@@ -45,25 +45,16 @@ def pit_loss_multispk(
 def vad_loss(ys: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
     # Take from reference ts only the speakers that do not correspond to -1
     # (-1 are padded frames), if the sum of their values is >0 there is speech
-    vad_ts = (torch.sum((ts != -1)*ts, 2, keepdim=True) > 0).float()
+    vad_ts = (torch.sum((ts != -1)*ts, 2) > 0).float()  # (B, T)
     # We work on the probability space, not logits. We use silence probabilities
     ys_silence_probs = 1-torch.sigmoid(ys)
+    all_ones_probs = torch.ones_like(ys_silence_probs)
+    ys_silence_probs = torch.where(ts < 0, all_ones_probs, ys_silence_probs)
     # The probability of silence in the frame is the product of the
     # probability that each speaker is silent
-    silence_prob = torch.prod(ys_silence_probs, 2, keepdim=True)
-    # Estimate the loss. size=[batch_size, num_frames, 1]
+    silence_prob = torch.prod(ys_silence_probs, 2)  # (B, T)
     loss = F.binary_cross_entropy(silence_prob, 1-vad_ts, reduction='none')
-    # "torch.max(ts, 2, keepdim=True)[0]" keeps the maximum along speaker dim
-    # Invalid frames in the sequence (padding) will be -1, replace those
-    # invalid positions by 0 so that those losses do not count
-    loss[torch.where(torch.max(ts, 2, keepdim=True)[0] < 0)] = 0
-    # normalize by sequence length
-    # "torch.sum(loss, axis=1)" gives a value per batch
-    # if torch.mean(ts,axis=2)==-1 then all speakers were invalid in the frame,
-    # therefore we should not account for it
-    # ts is size [batch_size, num_frames, num_spks]
-    loss = torch.sum(loss, axis=1) / (torch.mean(ts, axis=2) != -1).sum(axis=1, keepdims=True)
-    # normalize in batch for all speakers
-    loss = torch.mean(loss)
+    loss_mask = ((ts != -1).sum(dim=2) > 0).float()
+    loss = torch.sum(loss * loss_mask) / torch.sum(loss_mask)
     return loss
 

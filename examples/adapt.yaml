@@ -35,3 +35,4 @@ transformer_encoder_n_heads: 4
 transformer_encoder_n_layers: 4
 train_data_dir: <Kaldi data directory for train set (adaptation)>
 valid_data_dir: <Kaldi data directory for validation set (adaptation)>
+read_feat: False

@@ -176,3 +176,103 @@ def transform(
     else:
         raise ValueError('Unknown transform_type: %s' % transform_type)
     return Y.astype(dtype)
+
+def norm_log_mel(
+    Y: np.ndarray,
+    transform_type: str,
+    dtype: type = np.float32,
+) -> np.ndarray:
+    """ Transform STFT feature
+    Args:
+        Y: log_mel
+            (n_frames, mel_bins)-shaped array
+        transform_type:
+            None, "log"
+        dtype: output data type
+            np.float32 is expected
+    Returns:
+        Y (numpy.array): transformed feature
+    """
+    if transform_type == 'logmel_meannorm':
+        mean = np.mean(Y, axis=0)
+        Y = Y - mean
+    elif transform_type == 'logmel_meanvarnorm':
+        mean = np.mean(Y, axis=0)
+        Y = Y - mean
+        std = np.maximum(np.std(Y, axis=0), 1e-10)
+        Y = Y / std
+    else:
+        raise ValueError('Unknown transform_type: %s' % transform_type)
+    return Y.astype(dtype)
+
+def get_labels(
+    Y: np.ndarray,
+    kaldi_obj: KaldiData,
+    rec: str,
+    start: int,
+    end: int,
+    frame_size: int,
+    frame_shift: int,
+    n_speakers: int = None,
+    use_speaker_id: bool = False,
+    rate: int = 8000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extracts STFT and corresponding diarization labels for
+    given recording id and start/end times
+    Args:
+        Y: log_mel
+            (n_frames, mel_bins)-shaped array
+        kaldi_obj (KaldiData)
+        rec (str): recording id
+        start (int): start frame index
+        end (int): end frame index
+        frame_size (int): number of samples in a frame
+        frame_shift (int): number of shift samples
+        n_speakers (int): number of speakers
+            if None, the value is given from data
+        rate (int): sample rate
+    Returns:
+        Y: log_mel
+            (n_frames, mel_bins)-shaped np.float32 array,
+        T: label
+            (n_frmaes, n_speakers)-shaped np.int32 array.
+    """
+
+    filtered_segments = kaldi_obj.segments[rec]
+    # filtered_segments = kaldi_obj.segments[kaldi_obj.segments['rec'] == rec]
+    speakers = np.unique(
+        [kaldi_obj.utt2spk[seg['utt']] for seg
+         in filtered_segments]).tolist()
+    if n_speakers is None:
+        n_speakers = len(speakers)
+    T = np.zeros((Y.shape[0], n_speakers), dtype=np.int32)
+
+    if use_speaker_id:
+        all_speakers = sorted(kaldi_obj.spk2utt.keys())
+        S = np.zeros((Y.shape[0], len(all_speakers)), dtype=np.int32)
+
+    for seg in filtered_segments:
+        speaker_index = speakers.index(kaldi_obj.utt2spk[seg['utt']])
+        if use_speaker_id:
+            all_speaker_index = all_speakers.index(
+                kaldi_obj.utt2spk[seg['utt']])
+        start_frame = np.rint(
+            seg['st'] * rate / frame_shift).astype(int)
+        end_frame = np.rint(
+            seg['et'] * rate / frame_shift).astype(int)
+        rel_start = rel_end = None
+        if start <= start_frame and start_frame < end:
+            rel_start = start_frame - start
+        if start < end_frame and end_frame <= end:
+            rel_end = end_frame - start
+        if rel_start is not None or rel_end is not None:
+            T[rel_start:rel_end, speaker_index] = 1
+            if use_speaker_id:
+                S[rel_start:rel_end, all_speaker_index] = 1
+
+    if use_speaker_id:
+        return Y, T, S
+    else:
+        return Y, T
+

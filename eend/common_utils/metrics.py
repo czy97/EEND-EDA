@@ -37,6 +37,8 @@ def calculate_metrics(
         t_seq = target[seq_num, :, :]
         mask = (t_seq != -1)
         spk_num = torch.sum(mask, dim=-1).max()
+        if spk_num == 0:
+            continue
         # T_valid x spk_num
         t_seq = torch.reshape(
             torch.masked_select(t_seq, mask), (-1, spk_num))
